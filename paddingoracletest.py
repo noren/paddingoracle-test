@@ -26,8 +26,13 @@ from Crypto.Cipher import AES
 key = binascii.unhexlify('0123456789ABCDEF0123456789ABCDEF')
 iv = key
 plaintext = "This is a test for a padding oracle attack."
-blocksize = AES.block_size
+newplaintext = "A padding oracle can also be used to encrypt arbitrary values."
+encryptedendblock = "The last block!!"
 ##################
+blocksize = AES.block_size
+if len(encryptedendblock) != blocksize:
+    print "The block size of encryptedendblock must be " + str(blocksize)
+    sys.exit(1)
 
 def binprint(bin):
     hex = binascii.hexlify(bin)
@@ -37,11 +42,14 @@ def binprint(bin):
     
     return spaced
 
-# Encrypts plain text with given key and iv. Adds pkcs#7 padding.
-def encryptor(key, iv, pt):
+def add_pad(pt):
     padlen = (blocksize - (len(pt) % blocksize))
     padchar = chr(padlen)
-    pt = pt + padlen * padchar
+    return pt + padlen * padchar
+
+# Encrypts plain text with given key and iv. Adds pkcs#7 padding.
+def encryptor(key, iv, pt):
+    pt = add_pad(pt)
     cipher = AES.new(key, AES.MODE_CBC, iv)
     return iv + cipher.encrypt(pt)
     
@@ -62,6 +70,19 @@ def padding_oracle(msg):
             return False
     return True
 
+# Decrypts and returns something
+def decryptor(key, iv, ct):
+    cipher = AES.new(key, AES.MODE_CBC, iv)
+    return cipher.decrypt(ct)
+
+# Decomposites a string into array of strings of appropriate (block)length
+def blockify(str):
+    res = []
+    for i in range(0, len(str), blocksize):
+        res.append(str[i:i + blocksize])
+    return res
+    
+
 ### Main ###
 ct = encryptor(key, iv, plaintext);
 
@@ -70,12 +91,12 @@ if (padding_oracle(ct)):
 else:
     print "Padding of crypt text is broken."
 
+### Padding Oracle Decryption ###
+print "=== Padding Oracle Decryption Attack ==="
 # decomposite ciphertext into blocks
-ctb = []
 blocks = len(ct) / blocksize
 print str(blocks) + " blocks"
-for i in range(0, len(ct), blocksize):
-    ctb.append(ct[i:i + blocksize])
+ctb = blockify(ct)
 
 ptb = [""]
 for i in range(1, blocks):              # iterate over blocks from first one
@@ -115,7 +136,7 @@ for i in range(1, blocks):              # iterate over blocks from first one
                     if ord(pt) >= 32:
                         print "Got plain text byte " + str(m + 1) + " from block " + str(i) + ": " + pt + " (0x" + binascii.hexlify(pt) + ")"
                     else:
-                        print "Got plain text byte " + str(m + 1) + " from block " + str(i) + ": 0x" + binascii.hexlify(pt) + ")"
+                        print "Got plain text byte " + str(m + 1) + " from block " + str(i) + ": 0x" + binascii.hexlify(pt)
                 j = j - l - 1           # move pointer up to next byte which must be decrypted
 
                 pad = chr(ord(pad) + 1)
@@ -135,4 +156,78 @@ for i in range(1, blocks):              # iterate over blocks from first one
                 break
     print "Retrieved plain text block " + str(i) + ": " + "".join(ptb[i])
 ptb = ptb[1:]
-print "Retrieved plain text: " + "".join(map("".join, ptb))
+print "=== Retrieved plain text: " + "".join(map("".join, ptb))
+
+### Padding Oracle Encryption ###
+print "=== Padding Oracle Encryption Attack ==="
+
+blocks = len(newplaintext) / blocksize
+print str(blocks) + " blocks"
+ptb = blockify(add_pad(newplaintext))
+ctb = [encryptedendblock]
+
+while len(ptb) > 0:
+    block = ctb[len(ctb) - 1]
+    pt = ptb.pop()
+    iv = blocksize * list("\x00");      # this is the calculated iv to get a valid padding
+    iptb = blocksize * list("\x00");    # the "intermediate plain text", means the output of the cipher before XORing with the IV, short d(ct)
+    j = blocksize - 1                   # current position in block, starting at the end
+    pad = "\x01"                        # current padding character, starting at 0x01
+    print "Plaintext block: " + pt
+    while j >= 0:                       # iterate over iv from end (iv[j])
+        print "- IV byte " + str(j + 1)
+            
+        print "Trying bytes...",
+        for k in range(0, 256):         # brute force until an iv[j] is found, which causes a valid padding
+            print str(k),
+            iv[j] = chr(k)
+            if padding_oracle("".join(iv) + block): # found it!
+                print
+                l = 1
+                while j - l >= 0:     # but first verify, if we hit a bigger padding block as expected
+                    print "Verifying if byte " + str(j - l + 1) + " is also padding...",
+                    iv[j - l] = chr(ord(iv[j - l]) + 1 % 255)
+                    if padding_oracle("".join(iv) + block): # iv[j-l] was not relevant for the valid padding - restore iv and cancel scan
+                        print "no"
+                        iv[j - l] = chr(ord(iv[j - l]) - 1 % 255)
+                        l = l - 1
+                        break
+                    print "yes"
+                    pad = chr(ord(pad) + 1)
+                    iv[j - l] = chr(ord(iv[j - l]) - 1 % 255)
+                    l = l + 1
+                    
+                for m in range(j - l, j + 1): # iterate over padding to decrypt
+                    ipt = chr(ord(pad) ^ ord(iv[m])) # ...and retrieve intermediate plain text byte
+                    iptb[m] = ipt
+                    print "Got intermediate plain text byte " + str(m + 1) + ": 0x" + binascii.hexlify(ipt)
+                j = j - l - 1           # move pointer up to next byte which must be decrypted
+
+                pad = chr(ord(pad) + 1)
+                print "New padding byte is 0x" + binascii.hexlify(pad) + ", calculating iv bytes..."
+                for m in range(j + 1, blocksize): # recalculate iv to new expected padding bytes
+                    # for each byte of the iv we need a x, where (according to CBC encryption mode) the following condition applies:
+                    # iv ^ d(ct) ^ x = p
+                    # p is the incremented padding
+                    # solving this to x gives:
+                    # x = p ^ iv ^ d(ct)
+                    x = ord(pad) ^ ord(iv[m]) ^ ord(iptb[m])
+                    # This x is now used to calculate the new iv which results in the wanted padding
+                    iv[m] = chr(ord(iv[m]) ^ x)
+                    print "IV Byte " + str(m + 1) + " ^= 0x" + binascii.hexlify(chr(x)) + " = 0x" + binascii.hexlify(iv[m])
+                print
+                break
+
+    # encrypt plain text by data gathered from previous padding oracle attack
+    ct = ""
+    for j in range(0, blocksize):
+        iv[j] = chr(ord(iptb[j]) ^ ord(pt[j]))
+        print "Calculate ciphertext byte " + str(j) + ": 0x" + binascii.hexlify(iv[j])
+    print "Calculated ciphertext block (plain): " + "".join(iv)
+    print "Calculated ciphertext block (hex): " + binascii.hexlify("".join(iv))
+    ctb.append("".join(iv))
+ctb.reverse()
+
+print "Complete cipher text (hex): " + " ".join([binprint(ctblock) for ctblock in ctb])
+print "Complete cipher text (plain): " + "".join(ctb)
+print "=== Decrypted: " + decryptor(key, ctb[0], "".join(ctb[1:]))
